@@ -72,6 +72,14 @@
     touch-action: none;
   }
 
+  /* Zero-size filter SVG. Absolute so it does not open a line box and drop the header. */
+  .lab-ink-filter {
+    position: absolute;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+  }
+
   .frame {
     position: relative;
     width: 100%;
@@ -88,8 +96,8 @@
     --col: calc((100vw - 2 * var(--grid-margin) - 11 * var(--grid-gutter)) / 12);
     --letter-w: calc(6 * var(--col) + 5 * var(--grid-gutter));
     --letter-left: calc(var(--grid-margin) + 6 * (var(--col) + var(--grid-gutter)));
-    /* Bio is one 16*k line at 12*k. The clear gap under that block is 24px at every width. */
-    --wordmark-top: calc(28 * var(--k) + 24px);
+    /* Frame 596:52 is at y=12 on the 1440 frame. The wordmark box shares that top with the header row. */
+    --wordmark-top: calc(12 * var(--k));
     height: calc(800 * var(--k));
     background: transparent;
   }
@@ -151,8 +159,7 @@
     right: var(--grid-margin);
   }
 
-  /* One lettering silhouette. Same box as the old combined wordmark.
-     --wordmark-top still includes the 24px gap under the bio. */
+  /* Lettering box from frame 596:52. Top is the header row, not a gap under the bio. */
   .wordmark {
     position: absolute;
     z-index: 1;
@@ -164,7 +171,7 @@
     --col: calc((100vw - 2 * var(--grid-margin) - 11 * var(--grid-gutter)) / 12);
     --letter-w: calc(6 * var(--col) + 5 * var(--grid-gutter));
     --letter-left: calc(var(--grid-margin) + 6 * (var(--col) + var(--grid-gutter)));
-    --wordmark-top: calc(28 * var(--k) + 24px);
+    --wordmark-top: calc(12 * var(--k));
     left: var(--letter-left);
     top: var(--wordmark-top);
     width: var(--letter-w);
@@ -719,9 +726,10 @@
       font-size: calc(12 * var(--k));
     }
   }
+  /* Hidden, but inside the viewport. Off-screen video never reaches play() in Safari. */
   .cam-preview {
     position: fixed;
-    left: -1200px;
+    left: 0;
     top: 0;
     width: 160px;
     height: 120px;
@@ -1314,7 +1322,7 @@
   </section>
   <div id="sign-host"></div>
   <button type="button" class="cam-light cam-light-mob" aria-pressed="false" aria-label="Camera">Camera</button>
-  <video class="cam-preview" playsinline muted aria-hidden="true"></video>
+  <video class="cam-preview" autoplay muted playsinline webkit-playsinline aria-hidden="true"></video>
   <div class="layout-grid" hidden aria-hidden="true">
     <span></span><span></span><span></span><span></span>
     <span></span><span></span><span></span><span></span>
@@ -1662,53 +1670,84 @@
       if (video) video.srcObject = null;
       paintCamButtons();
     }
+    function openCameraStream() {
+      // This Mac camera reports facingMode: []. An exact 'user' constraint
+      // rejects with OverconstrainedError, and the old catch never tried again.
+      var preferred = {
+        audio: false,
+        video: { facingMode: { ideal: 'user' }, width: { ideal: 320 }, height: { ideal: 240 } }
+      };
+      return navigator.mediaDevices.getUserMedia(preferred).catch(function (err) {
+        if (!err || err.name !== 'OverconstrainedError') throw err;
+        return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+      });
+    }
+    function startVideo(next) {
+      if (!video) return Promise.reject(new Error('Camera video missing'));
+      video.muted = true;
+      video.defaultMuted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.setAttribute('muted', '');
+      video.setAttribute('playsinline', '');
+      video.setAttribute('autoplay', '');
+      video.srcObject = next;
+      var play = video.play();
+      var played = (play && play.then) ? play : Promise.resolve();
+      return played.then(function () {
+        if (video.videoWidth > 0 && video.readyState >= 2) return;
+        return new Promise(function (resolve, reject) {
+          var timer = setTimeout(function () {
+            if (video.videoWidth > 0) resolve();
+            else reject(new Error('Camera video did not play'));
+          }, 3000);
+          video.addEventListener('loadeddata', function () {
+            clearTimeout(timer);
+            if (video.videoWidth > 0) resolve();
+            else reject(new Error('Camera video has no frames'));
+          }, { once: true });
+        });
+      });
+    }
     function askCamera() {
-      if (cameraOn || cameraPending || cameraStarting || cameraDenied) return;
+      if (cameraOn || cameraPending || cameraStarting) return;
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
         cameraDenied = true;
         paintCamButtons();
         return;
       }
+      cameraDenied = false;
       trackerBroken = false;
       cameraPending = true;
-      navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }
-      }).then(function (next) {
+      if (video) {
+        video.muted = true;
+        video.playsInline = true;
+        video.autoplay = true;
+      }
+      openCameraStream().then(function (next) {
         cameraPending = false;
         if (!next) return;
         stream = next;
         cameraStarting = true;
         gazeRaw.x = 0.5;
         gazeRaw.y = 0.5;
-        if (video) {
-          video.srcObject = next;
-          var play = video.play();
-          if (play && play.catch) play.catch(function () {});
-        }
         paintCamButtons();
-        ensureFaceMesh().then(function () {
-          if (!stream || !cameraStarting) return;
-          cameraStarting = false;
-          cameraOn = true;
-          meshLoopOn = true;
-          paintCamButtons();
-          headFrameId = requestAnimationFrame(meshFrame);
-        }).catch(function () {
-          trackerBroken = true;
-          stopCamera();
+        return startVideo(next).then(function () {
+          return ensureFaceMesh();
         });
-      }).catch(function () {
-        cameraPending = false;
-        cameraOn = false;
-        cameraDenied = true;
-        gaze.active = false;
-        window.__labHeadDrive = false;
-        if (stream) {
-          stream.getTracks().forEach(function (track) { track.stop(); });
-          stream = null;
-        }
+      }).then(function () {
+        if (!stream || !cameraStarting) return;
+        cameraStarting = false;
+        cameraOn = true;
+        meshLoopOn = true;
         paintCamButtons();
+        headFrameId = requestAnimationFrame(meshFrame);
+      }).catch(function (err) {
+        if (!cameraPending && !cameraStarting && !stream) return;
+        var denied = !!(err && (err.name === 'NotAllowedError' || err.name === 'SecurityError'));
+        cameraDenied = denied;
+        trackerBroken = !denied;
+        stopCamera();
       });
     }
     var camButtons = document.querySelectorAll('.cam-light');
